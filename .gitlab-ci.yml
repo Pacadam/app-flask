@@ -1,0 +1,82 @@
+stages:
+  - test
+  - build
+  - deploy
+  - rollback
+
+variables:
+  IMAGE_NAME: registry.gitlab.com/$CI_PROJECT_PATH/hello-flask
+  IMAGE_TAG: $CI_COMMIT_SHORT_SHA
+  CONTAINER_NAME: mon-app-flask
+
+run_unit_tests:
+  stage: test
+  image: python:3.14
+  before_script:
+    - pip install -r requirements.txt
+  script:
+    - pytest test_app.py -v
+
+build_and_push:
+  stage: build
+  image: docker:29.4.0
+  services:
+    - name: docker:29.4.0-dind
+      alias: docker
+      command: ["--tls=false"] 
+  variables:
+    DOCKER_DRIVER: overlay2
+    HEALTHCHECK_TCP_PORT: "2375"
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - docker pull $IMAGE_NAME:latest || true
+    - docker tag $IMAGE_NAME:latest $IMAGE_NAME:previous || true
+    - docker push $IMAGE_NAME:previous || true
+    - docker build -t $IMAGE_NAME:$IMAGE_TAG .
+    - docker tag $IMAGE_NAME:$IMAGE_TAG $IMAGE_NAME:latest
+    - docker push $IMAGE_NAME:$IMAGE_TAG
+    - docker push $IMAGE_NAME:latest
+
+deploy_image:
+  stage: deploy
+  only:
+    - main
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq openssh-client
+    - eval $(ssh-agent -s)
+    - chmod 600 $SSH_PRIVATE_KEY
+    - ssh-add $SSH_PRIVATE_KEY
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+  script:
+    - |
+      ssh -o StrictHostKeyChecking=no $SSH_USER@$SSH_HOST \
+        "docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY && \
+        docker pull $IMAGE_NAME:latest && \
+        docker stop $CONTAINER_NAME || true ; \
+        docker rm $CONTAINER_NAME || true ; \
+        docker run --detach --name $CONTAINER_NAME \
+        --restart unless-stopped -p 80:5000 $IMAGE_NAME:latest"
+
+rollback:
+  stage: rollback
+  when: manual
+  only:
+    - main
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq openssh-client
+    - eval $(ssh-agent -s)
+    - chmod 600 $SSH_PRIVATE_KEY
+    - ssh-add $SSH_PRIVATE_KEY
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+  script:
+    - |
+      ssh -o StrictHostKeyChecking=no $SSH_USER@$SSH_HOST \
+        "docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY && \
+        docker stop $CONTAINER_NAME || true ; \
+        docker rm $CONTAINER_NAME || true ; \
+        docker run --detach --name $CONTAINER_NAME \
+        --restart unless-stopped -p 80:5000 $IMAGE_NAME:previous
